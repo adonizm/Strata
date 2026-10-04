@@ -1,5 +1,12 @@
 <h1 align="center">Strata</h1>
 
+> [!NOTE]
+> **This is a fork with a prompt-speed fix for PCs whose RAM is smaller than the model's experts** (for example
+> 32 GB of RAM with IQ3_XXS, whose experts take 43 GB). The changes are proposed upstream in
+> [Niko1221/Strata#833](https://github.com/Niko1221/Strata/pull/833); everything else is unchanged upstream Strata.
+> See [What this fork changes](#what-this-fork-changes) below.
+
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
@@ -12,6 +19,66 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
+
+## What this fork changes
+
+**Who it helps:** Windows PCs where the model's experts do not fit in RAM, so Strata reads part of them from the SSD
+on every prompt. If your log shows a low "read in ... tok/s" on long prompts and Task Manager shows the SSD busy
+while the GPU waits, this is for you.
+
+**Measured** on an RTX 5070 Ti 16 GB + RTX 3060 12 GB, Ryzen 7 7800X3D, 32 GB RAM, WD SN580 NVMe, IQ3_XXS:
+
+| | Reads a 47.6K-token prompt | Reads a 115K-token prompt | Writes answers |
+|---|---:|---:|---:|
+| Before (stock 0.1.39 config) | 227 tokens/s | not possible (64K context) | 33.6 tokens/s |
+| **This fork** (128K context) | **~1,650 tokens/s** | **~1,700 tokens/s** | **~43 tokens/s** |
+
+**Why it was slow:** each prompt chunk needs almost every expert, and the ones that are in neither VRAM nor RAM
+were read through memory-mapped page faults at ~0.7 GB/s. Windows (NTFS) also runs the unbuffered reads of a file
+one at a time while that file is memory-mapped: on the SN580, 2 MiB reads at queue depth 32 measured 2.35 GB/s with
+`experts.bin` mapped and 3.57 GB/s without.
+
+**What the code changes do** (branch [`pp-opt`](https://github.com/adonizm/Strata/tree/pp-opt)):
+
+1. The prompt path reads neighbouring experts in one request instead of one each (`STRATA_STAGER_BATCH`, default 8).
+2. Once startup is done, the memory map of `experts.bin` is closed, so the drive serves many reads at once
+   (`STRATA_KEEP_MAPPING=1` keeps the old behaviour).
+3. `STRATA_RESIDENT_REMOTE=1` (opt-in, experimental) allows a RAM budget (`--resident-budget-gib` or
+   `--resident-experts`) together with a second GPU's helper cache (`--expert-cache-device1`). The stock engine refuses
+   that combination. The RAM speeds up prompts, and the second GPU speeds up answers.
+
+**How to use it:**
+
+1. Install Strata normally first, so the model, the packs and the CUDA libraries are in place.
+2. Download `strata.exe` from this fork's [Releases](https://github.com/adonizm/Strata/releases), or build it
+   (`cmake` with `-DSTRATA_ENABLE_CUDA=ON`, as `setup.py` does). The release build covers RTX 30, 40 and 50 cards.
+   Save it as `engine\strata-ppopt.exe` so the official one is kept.
+3. In your model's `strata-<model>.json`, point `"exe"` at it and change these settings:
+
+```json
+"exe": "<Strata folder>\\engine\\strata-ppopt.exe",
+"args": [ "...",
+  "--max-context", "131072",
+  "--prefill", "auto:32768",
+  "--resident-budget-gib", "16",
+  "..." ],
+"env": {
+  "STRATA_RESIDENT_REMOTE": "1",
+  "STRATA_PREFILL_LEND_PCT": "90"
+}
+```
+
+- `--resident-budget-gib N` keeps the hottest N GiB of experts in RAM. Leave about 14-16 GB free for Windows and the
+  engine: 16 on a 32 GB PC.
+- `--prefill auto:32768` lets the prompt chunks grow past 8,192 tokens, so a long prompt needs fewer passes over the
+  experts. This is the biggest single gain when the SSD is the limit.
+- `STRATA_RESIDENT_REMOTE=1` is only needed with a second GPU (`--expert-cache-device1`).
+- `STRATA_PREFILL_LEND_PCT=90` helped the IQ3_XXS model at 128K context, but made the Coder IQ1_M (whose experts fit in
+  RAM) slower. Measure your own prompts.
+- Keep your config's other arguments (`--pack`, `--native`, `--mtp`, ...) as they are.
+
+To go back, point `"exe"` at `engine\strata.exe` again and remove the lines above.
+
 
 ## How fast is it?
 
